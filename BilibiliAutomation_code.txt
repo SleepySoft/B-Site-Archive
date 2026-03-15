@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         B站合集下载助手 (面板控制版)
+// @name         B站合集下载助手 (兼容多重列表)
 // @namespace    http://tampermonkey.net/
-// @version      6.0
+// @version      7.0
 // @description  顶部控制面板，手动开始/停止，自动连续下载+跳转，Shadow DOM穿透
 // @author       You
 // @match        https://www.bilibili.com/video/*
@@ -191,29 +191,44 @@
 
     // ================= ⏭️ 跳转逻辑 =================
     function jumpToNext() {
-        if (!isRunning) return; // 二次检查，防止在等待期间用户点击了停止
+        if (!isRunning) return;
 
         addLog("🚀 正在寻找下一集...", "white");
 
         const listContainer = document.querySelector('.video-pod__list');
-        const activeItem = listContainer.querySelector('.simple-base-item.active');
-
-        if (!activeItem) {
-            addLog("❌ 错误：找不到当前选中项", "red");
+        if (!listContainer) {
+            addLog("❌ 错误：找不到播放列表容器", "red");
             return;
         }
 
-        const currentPod = activeItem.closest('.pod-item');
-        const nextPod = currentPod ? currentPod.nextElementSibling : null;
+        // 🌟 核心优化：降维拍平
+        // 抓取列表内所有的真实视频条目，排除掉多层列表的折叠头部(.head)
+        const allItems = Array.from(listContainer.querySelectorAll('.simple-base-item:not(.head)'));
 
-        if (nextPod) {
-            // 尝试点击标题
-            const link = nextPod.querySelector('.title') || nextPod;
-            const titleText = link.innerText || "下一集";
+        // 寻找当前拥有 active 状态的索引
+        const currentIndex = allItems.findIndex(item => item.classList.contains('active'));
+
+        if (currentIndex === -1) {
+            addLog("❌ 错误：在列表中未找到当前高亮的 active 视频", "red");
+            return;
+        }
+
+        // 判断是否还有下一个视频
+        if (currentIndex + 1 < allItems.length) {
+            const nextItem = allItems[currentIndex + 1];
+
+            // 提取干净的标题文本用于日志显示
+            const titleTxtNode = nextItem.querySelector('.title-txt') || nextItem;
+            const titleText = titleTxtNode.innerText.trim() || "下一集";
 
             addLog(`⏭️ 跳转中: ${titleText}`, "#00A1D6");
-            link.click();
-            // 注意：点击后 URL 稍后会变，主循环会捕获并重置
+
+            // B站的点击事件通常绑定在 .title 上
+            const clickTarget = nextItem.querySelector('.title') || nextItem;
+
+            // 原生 JS 触发点击，不受 CSS 隐藏（多层列表折叠）的限制
+            clickTarget.click();
+
         } else {
             addLog("🏁 列表播放结束，脚本自动停止。", "red");
             isRunning = false;
@@ -222,5 +237,4 @@
             alert("合集所有视频已处理完毕！");
         }
     }
-
 })();
