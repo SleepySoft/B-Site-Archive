@@ -30,8 +30,18 @@ class VideoItem:
             "title": self.title,
             "duration": self.duration,
             "is_group": self.is_group,
-            "children": [c.to_dict() for c in self.children]
+            "children": [c.to_dict() for c in self.children],
+            "index": self.index
         }
+
+    # === 补充这个方法，否则你的 load_list 会报错 ===
+    @classmethod
+    def from_dict(cls, data):
+        item = cls(data["title"], data.get("duration", ""), data.get("is_group", False))
+        item.index = data.get("index", 0)
+        for child_data in data.get("children", []):
+            item.children.append(cls.from_dict(child_data))
+        return item
 
 
 class PlaywrightScraper:
@@ -321,64 +331,72 @@ class VideoManagerApp(QMainWindow):
     def match_files(self):
         """
         匹配逻辑：
-        1. 优先匹配文件名中包含的纯数字索引 (如 "01.mp4" 对应 index=1)
-        2. 其次匹配文件名相似度
+        1. 精确匹配：文件名开头的数字索引 (100%匹配，直接锁定并剔除池子)
+        2. 模糊匹配：计算所有未匹配条目与未匹配文件的相似度，按分数从高到低全局分配
         """
         if not self.video_data or not self.work_dir:
             return
 
         self.scan_local_files()
 
-        # 重置所有匹配
+        # 收集所有的子条目，并重置它们的匹配状态
+        all_children = []
         for g in self.video_data:
             for c in g.children:
                 c.matched_file = None
+                all_children.append(c)
 
-        files_pool = self.local_files.copy()
+        # 创建待匹配池 (使用 set 方便移除元素)
+        unmatched_files = set(self.local_files)
+        unmatched_children = set(all_children)
 
-        # 遍历所有需要的子条目
-        for g in self.video_data:
-            for child in g.children:
-                best_file = None
-                best_score = 0
-                match_method = ""
+        # ---------------------------------------------------------
+        # 阶段 A: 精确匹配 (提取文件名开头的数字)
+        # ---------------------------------------------------------
+        for child in list(unmatched_children):
+            target_idx = child.index
+            for f_path in list(unmatched_files):
+                f_name = os.path.basename(f_path)
+                num_match = re.match(r'^(\d+)', f_name)
 
-                target_idx = child.index
-                target_title_clean = re.sub(r'[^\w]', '', child.title)  # 去掉标点方便对比
+                if num_match and int(num_match.group(1)) == target_idx:
+                    # 找到绝对匹配，锁定！
+                    child.matched_file = f_path
+                    # 从池子中移除，确保 1 对 1 独占
+                    unmatched_files.remove(f_path)
+                    unmatched_children.remove(child)
+                    break  # 停止当前 child 的查找，进入下一个 child
 
-                for f_path in files_pool:
-                    f_name = os.path.basename(f_path)
-                    f_name_pure = os.path.splitext(f_name)[0]
+        # ---------------------------------------------------------
+        # 阶段 B: 全局文本相似度最优匹配
+        # ---------------------------------------------------------
+        match_candidates = []  # 用于存储 (相似度得分, child对象, 文件路径)
 
-                    # 规则A: 提取文件名开头的数字
-                    # 匹配 "01.mp4", "01 标题.mp4", "1-标题.mp4"
-                    num_match = re.match(r'^(\d+)', f_name)
-                    if num_match:
-                        if int(num_match.group(1)) == target_idx:
-                            # 找到绝对索引匹配，优先级最高，直接锁定
-                            best_file = f_path
-                            match_method = "index"
-                            break
+        # 计算所有剩下的 [未匹配条目] x [未匹配文件] 的得分
+        for child in unmatched_children:
+            target_title_clean = re.sub(r'[^\w]', '', child.title)
+            for f_path in unmatched_files:
+                f_name_pure = os.path.splitext(os.path.basename(f_path))[0]
+                # 计算比率
+                score = difflib.SequenceMatcher(None, target_title_clean, f_name_pure).ratio()
 
-                            # 规则B: 文本相似度 (如果没有索引匹配，或者文件名里没数字)
-                    ratio = difflib.SequenceMatcher(None, target_title_clean, f_name_pure).ratio()
-                    if ratio > best_score:
-                        best_score = ratio
-                        best_file = f_path
-                        match_method = "text"
+                # 设定及格线，低于0.4没必要参与竞争
+                if score >= 0.4:
+                    match_candidates.append((score, child, f_path))
 
-                # 判定
-                if best_file:
-                    # 如果是文本匹配，设定一个阈值防止乱配
-                    if match_method == "text" and best_score < 0.4:
-                        continue
+        # 按得分从高到低排序 (关键点：让最匹配的优先挑走文件)
+        match_candidates.sort(key=lambda x: x[0], reverse=True)
 
-                    child.matched_file = best_file
-                    # 暂时不从pool移除，允许一对多检查（虽然最终rename会冲突，但在UI上先显示出来）
-                    # 严格模式下应该： files_pool.remove(best_file)
+        # 遍历排序后的候选列表进行分配
+        for score, child, f_path in match_candidates:
+            # 必须双方都还在未匹配池中，才能结合
+            if child in unmatched_children and f_path in unmatched_files:
+                child.matched_file = f_path
+                unmatched_children.remove(child)
+                unmatched_files.remove(f_path)
 
         self.refresh_tree()
-        self.status_bar.showMessage("匹配完成。请检查匹配结果是否正确。")
+        self.status_bar.showMessage(f"匹配完成！剩余 {len(unmatched_files)} 个未匹配文件。")
 
     def perform_renaming(self):
         if not self.work_dir: return
