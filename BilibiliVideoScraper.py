@@ -330,28 +330,44 @@ class VideoManagerApp(QMainWindow):
 
     def match_files(self):
         """
-        匹配逻辑：
-        1. 精确匹配：文件名开头的数字索引 (100%匹配，直接锁定并剔除池子)
-        2. 模糊匹配：计算所有未匹配条目与未匹配文件的相似度，按分数从高到低全局分配
+        匹配逻辑（三阶段防干扰）：
+        0. 完美就绪匹配：优先锁定已经按最终格式重命名好的文件，防止重复下载的文件干扰。
+        1. 精确匹配：匹配文件名开头的纯数字索引。
+        2. 模糊匹配：计算全局文本相似度，按得分从高到低最优分配。
         """
         if not self.video_data or not self.work_dir:
             return
 
         self.scan_local_files()
 
-        # 收集所有的子条目，并重置它们的匹配状态
         all_children = []
         for g in self.video_data:
             for c in g.children:
                 c.matched_file = None
                 all_children.append(c)
 
-        # 创建待匹配池 (使用 set 方便移除元素)
         unmatched_files = set(self.local_files)
         unmatched_children = set(all_children)
 
         # ---------------------------------------------------------
-        # 阶段 A: 精确匹配 (提取文件名开头的数字)
+        # 阶段 0: 完美就绪匹配 (防重复下载干扰)
+        # ---------------------------------------------------------
+        for child in list(unmatched_children):
+            # 模拟重命名时的合法文件名生成规则
+            safe_title = re.sub(r'[\\/:*?"<>|]', '_', child.title)
+            expected_name_pure = f"{child.index:03d} - {safe_title}"
+
+            for f_path in list(unmatched_files):
+                f_name_pure = os.path.splitext(os.path.basename(f_path))[0]
+                # 如果发现名字已经一模一样了，直接锁定！
+                if f_name_pure == expected_name_pure:
+                    child.matched_file = f_path
+                    unmatched_files.remove(f_path)
+                    unmatched_children.remove(child)
+                    break
+
+                    # ---------------------------------------------------------
+        # 阶段 1: 数字前缀精确匹配
         # ---------------------------------------------------------
         for child in list(unmatched_children):
             target_idx = child.index
@@ -360,43 +376,34 @@ class VideoManagerApp(QMainWindow):
                 num_match = re.match(r'^(\d+)', f_name)
 
                 if num_match and int(num_match.group(1)) == target_idx:
-                    # 找到绝对匹配，锁定！
                     child.matched_file = f_path
-                    # 从池子中移除，确保 1 对 1 独占
                     unmatched_files.remove(f_path)
                     unmatched_children.remove(child)
-                    break  # 停止当前 child 的查找，进入下一个 child
+                    break
 
         # ---------------------------------------------------------
-        # 阶段 B: 全局文本相似度最优匹配
+        # 阶段 2: 全局文本相似度最优匹配
         # ---------------------------------------------------------
-        match_candidates = []  # 用于存储 (相似度得分, child对象, 文件路径)
-
-        # 计算所有剩下的 [未匹配条目] x [未匹配文件] 的得分
+        match_candidates = []
         for child in unmatched_children:
             target_title_clean = re.sub(r'[^\w]', '', child.title)
             for f_path in unmatched_files:
                 f_name_pure = os.path.splitext(os.path.basename(f_path))[0]
-                # 计算比率
                 score = difflib.SequenceMatcher(None, target_title_clean, f_name_pure).ratio()
 
-                # 设定及格线，低于0.4没必要参与竞争
                 if score >= 0.4:
                     match_candidates.append((score, child, f_path))
 
-        # 按得分从高到低排序 (关键点：让最匹配的优先挑走文件)
         match_candidates.sort(key=lambda x: x[0], reverse=True)
 
-        # 遍历排序后的候选列表进行分配
         for score, child, f_path in match_candidates:
-            # 必须双方都还在未匹配池中，才能结合
             if child in unmatched_children and f_path in unmatched_files:
                 child.matched_file = f_path
                 unmatched_children.remove(child)
                 unmatched_files.remove(f_path)
 
         self.refresh_tree()
-        self.status_bar.showMessage(f"匹配完成！剩余 {len(unmatched_files)} 个未匹配文件。")
+        self.status_bar.showMessage(f"匹配完成！剩余 {len(unmatched_files)} 个多余文件。")
 
     def perform_renaming(self):
         if not self.work_dir: return
@@ -432,16 +439,25 @@ class VideoManagerApp(QMainWindow):
 
         if reply == QMessageBox.Yes:
             err_count = 0
-            for old, new in tasks:
+            skip_count = 0
+            for old, new in tasks:-+
                 try:
+                    # 增加一层保险：如果目标文件已经存在，并且不是它自己本身，则跳过
+                    if os.path.exists(new) and old != new:
+                        print(f"Skip: 目标文件已存在冲突 -> {new}")
+                        skip_count += 1
+                        continue
+
                     os.rename(old, new)
                 except OSError as e:
                     print(f"Rename error: {e}")
                     err_count += 1
 
             msg = "重命名操作完成！"
+            if skip_count > 0:
+                msg += f"\n跳过了 {skip_count} 个文件 (目标文件名已被占用)。"
             if err_count > 0:
-                msg += f"\n有 {err_count} 个文件重命名失败 (可能被占用)。"
+                msg += f"\n有 {err_count} 个文件重命名失败 (可能正在被播放器占用)。"
 
             QMessageBox.information(self, "完成", msg)
             self.scan_local_files()  # 重新扫描
